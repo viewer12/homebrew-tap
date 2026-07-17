@@ -1,0 +1,143 @@
+name: Bump nexus-shell cask
+
+# Polls the Nexus Shell release manifest and bumps the cask when a new version
+# ships. Pull, not push: the website repo is private, so having it push here
+# would mean a cross-repo PAT. Polling needs nothing but the default token, and
+# a missed run heals itself on the next tick.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bump-cask
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_ANALYTICS: 1
+  MANIFEST_URL: https://nexusshell.app/releases/latest.json
+  CASK_PATH: Casks/nexus-shell.rb
+
+jobs:
+  bump:
+    # Must be arm64: the cask declares `depends_on arch: :arm64`, so the
+    # install smoke test below cannot run on an Intel runner.
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare manifest against cask
+        id: check
+        run: |
+          set -euo pipefail
+          curl -fsSL "$MANIFEST_URL" -o /tmp/latest.json
+
+          new_version=$(jq -er .version /tmp/latest.json)
+          new_sha=$(jq -r '.sha256 // empty' /tmp/latest.json)
+          filename=$(jq -er .filename /tmp/latest.json)
+          cur_version=$(awk -F'"' '/^  version /{print $2; exit}' "$CASK_PATH")
+
+          echo "manifest: $new_version   cask: $cur_version"
+          {
+            echo "new_version=$new_version"
+            echo "new_sha=$new_sha"
+            echo "filename=$filename"
+            echo "cur_version=$cur_version"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$new_version" = "$cur_version" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve sha256
+        id: sha
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          sha='${{ steps.check.outputs.new_sha }}'
+          if [ -n "$sha" ]; then
+            echo "sha256 from manifest: $sha"
+          else
+            # Manifest predates the sha256 field — hash the artifact ourselves.
+            echo "Manifest has no sha256; downloading to hash."
+            curl -fsSL "https://releases.nexusshell.app/${{ steps.check.outputs.filename }}" -o /tmp/installer.dmg
+            sha=$(shasum -a 256 /tmp/installer.dmg | cut -d' ' -f1)
+            echo "sha256 computed: $sha"
+          fi
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Rewrite cask
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          sed -i '' -E "s|^  version \".*\"|  version \"${{ steps.check.outputs.new_version }}\"|" "$CASK_PATH"
+          sed -i '' -E "s|^  sha256 \".*\"|  sha256 \"${{ steps.sha.outputs.sha256 }}\"|" "$CASK_PATH"
+          git --no-pager diff -- "$CASK_PATH"
+
+      - name: Register as a local tap
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          taps="$(brew --repository)/Library/Taps/viewer12"
+          mkdir -p "$taps"
+          ln -sfn "$GITHUB_WORKSPACE" "$taps/homebrew-tap"
+          brew tap | grep viewer12
+          brew trust --tap viewer12/tap
+
+      - name: brew style + audit
+        if: steps.check.outputs.changed == 'true'
+        env:
+          HOMEBREW_DEVELOPER: 1
+        run: |
+          set -euo pipefail
+          brew style "$CASK_PATH"
+          brew audit --cask --online --strict viewer12/tap/nexus-shell
+
+      - name: Install smoke test
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          brew install --cask viewer12/tap/nexus-shell
+          test -d "/Applications/Nexus Shell.app"
+
+          # The installed bundle's version must match the cask exactly.
+          #
+          # This is not cosmetic. `auto_updates true` makes `brew upgrade`
+          # compare the cask version against CFBundleShortVersionString, and
+          # that comparison returns nil — silently meaning "not outdated" —
+          # when the two have a different number of dot-separated segments.
+          # Ship a cask "1.6" against a bundle "1.6.0" and every user is
+          # frozen forever with no error anywhere. Asserting equality here
+          # subsumes the segment check and catches manifest/bundle drift too.
+          bundle_version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
+            "/Applications/Nexus Shell.app/Contents/Info.plist")
+          echo "cask: ${{ steps.check.outputs.new_version }}   bundle: $bundle_version"
+          if [ "$bundle_version" != "${{ steps.check.outputs.new_version }}" ]; then
+            echo "::error::Bundle version '$bundle_version' does not match cask version '${{ steps.check.outputs.new_version }}'."
+            exit 1
+          fi
+
+          brew uninstall --cask nexus-shell
+
+      - name: Commit
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$CASK_PATH"
+          git commit -m "nexus-shell ${{ steps.check.outputs.new_version }}
+
+          Bumped from ${{ steps.check.outputs.cur_version }} by the scheduled
+          manifest poll. Validated with brew style, brew audit --online
+          --strict, and an install smoke test on an arm64 runner."
+          git push
