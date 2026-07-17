@@ -1,22 +1,40 @@
 name: Bump nexus-shell cask
 
-# Watches viewer12/Nexus-Shell-Releases and bumps the cask when a new version
-# ships. Pull, not push: the website repo is private, so having it push here
-# would mean a cross-repo PAT. Polling needs nothing but the default token, and
-# a missed run heals itself on the next tick.
+# Bumps the cask when the website publishes a new release manifest.
 #
-# Why the GitHub API and not https://nexusshell.app/releases/latest.json, which
-# is the site's actual source of truth: that host sits behind Cloudflare bot
-# protection which returns 403 to GitHub's datacenter IPs. Verified — the same
-# curl returns 200 from a residential IP with any User-Agent, and 403 from a
-# runner, so this is ASN-based and no header works around it. The GitHub release
-# carries the same version and publishes a sha256 digest of the asset, and the
-# R2 copy is byte-identical to it.
+# Pull, not push: the website repo is private, so having it push here would mean
+# a cross-repo PAT. Polling needs nothing but the default token, and a missed
+# run heals itself on the next tick.
 #
-# The tradeoff is a race: the GitHub release is published BEFORE the release
-# flow uploads the DMG to R2, so for a short window the new version exists on
-# GitHub while the cask's R2 url would 404. The "Wait for R2" step below exits
-# the run cleanly (not red) in that window; the next tick picks it up.
+# ---------------------------------------------------------------------------
+# Which hosts this job may talk to — measured from a runner, not assumed:
+#
+#   nexusshell.app                403    Cloudflare bot protection rejects
+#   releases.nexusshell.app       403    GitHub's datacenter IPs across the
+#   updates.nexusshell.app        403    whole zone. Not a User-Agent problem:
+#                                        the same curl gets 200 from a
+#                                        residential IP with any UA.
+#   nexus-shell.pages.dev         200    Pages domain, different zone, no bot
+#                                        rules. Byte-identical to production.
+#   github.com release assets     200
+#
+# Two consequences the obvious implementation gets wrong:
+#
+#  1. The trigger reads the manifest from nexus-shell.pages.dev, NOT from
+#     nexusshell.app. Same bytes, but reachable.
+#
+#  2. The cask's `url` points at R2 (releases.nexusshell.app) because that is
+#     fast for users, especially in mainland China — but CI cannot download it.
+#     So `brew install --cask` is NOT the smoke test here; it would 403. We
+#     validate the byte-identical GitHub copy instead (confirmed identical by
+#     sha256), mounting it to assert the bundle version.
+#
+# Why the manifest and not the GitHub release as the trigger: the GitHub
+# release is published BEFORE the release flow uploads the DMG to R2, so
+# following it would briefly point the cask at a 404. latest.json only changes
+# after the R2 upload (skill Phase 1) and the deploy (Phase 4), so
+# manifest == V implies R2 already has V. It is the correct gate.
+# ---------------------------------------------------------------------------
 
 on:
   schedule:
@@ -33,36 +51,31 @@ concurrency:
 env:
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_ANALYTICS: 1
+  # Deliberately the Pages domain — the apex 403s from runners. See above.
+  MANIFEST_URL: https://nexus-shell.pages.dev/releases/latest.json
   RELEASES_REPO: viewer12/Nexus-Shell-Releases
-  R2_HOST: releases.nexusshell.app
   CASK_PATH: Casks/nexus-shell.rb
 
 jobs:
   bump:
-    # Must be arm64: the cask declares `depends_on arch: :arm64`, so the
-    # install smoke test below cannot run on an Intel runner.
     runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compare latest release against cask
+      - name: Compare manifest against cask
         id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api "repos/$RELEASES_REPO/releases/latest" > /tmp/release.json
+          curl -fsSL "$MANIFEST_URL" -o /tmp/latest.json
+          cat /tmp/latest.json
 
-          tag=$(jq -er .tag_name /tmp/release.json)
-          new_version="${tag#v}"
-          filename="Nexus-Shell-v${new_version}.dmg"
-          # GitHub publishes the asset digest as "sha256:<hex>".
-          new_sha=$(jq -r --arg f "$filename" \
-            '.assets[] | select(.name == $f) | .digest // empty' /tmp/release.json | sed 's/^sha256://')
+          new_version=$(jq -er .version /tmp/latest.json)
+          new_sha=$(jq -r '.sha256 // empty' /tmp/latest.json)
+          filename=$(jq -er .filename /tmp/latest.json)
           cur_version=$(awk -F'"' '/^  version /{print $2; exit}' "$CASK_PATH")
 
-          echo "latest release: $new_version   cask: $cur_version"
+          echo "manifest: $new_version   cask: $cur_version"
           {
             echo "new_version=$new_version"
             echo "new_sha=$new_sha"
@@ -77,98 +90,79 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Wait for the DMG to reach R2
-        id: r2
+      - name: Fetch and verify the artifact
+        id: artifact
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version='${{ steps.check.outputs.new_version }}'
+          filename='${{ steps.check.outputs.filename }}'
+
+          # R2 is unreachable from here, so validate the GitHub copy. It is the
+          # same build; the sha256 assertions below are what make that claim
+          # safe rather than assumed.
+          gh release download "v${version}" --repo "$RELEASES_REPO" \
+            --pattern "$filename" --dir /tmp --clobber
+
+          actual_sha=$(shasum -a 256 "/tmp/$filename" | cut -d' ' -f1)
+          echo "sha256 of GitHub artifact: $actual_sha"
+
+          manifest_sha='${{ steps.check.outputs.new_sha }}'
+          if [ -n "$manifest_sha" ] && [ "$manifest_sha" != "$actual_sha" ]; then
+            echo "::error::Manifest sha256 ($manifest_sha) does not match the GitHub artifact ($actual_sha). The site and the release disagree about what shipped — refusing to bump."
+            exit 1
+          fi
+          echo "sha256=$actual_sha" >> "$GITHUB_OUTPUT"
+
+          # Mount and assert the bundle version matches the cask exactly.
+          #
+          # Not cosmetic: `auto_updates true` makes `brew upgrade` compare the
+          # cask version against CFBundleShortVersionString, and that comparison
+          # returns nil — silently meaning "not outdated" — when the two have a
+          # different number of dot-separated segments. Ship a cask "1.6"
+          # against a bundle "1.6.0" and every user is frozen forever with no
+          # error anywhere. Asserting equality subsumes the segment check.
+          hdiutil attach -nobrowse -readonly -mountpoint /tmp/dmg "/tmp/$filename"
+          bundle_version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
+            "/tmp/dmg/Nexus Shell.app/Contents/Info.plist")
+          codesign -dv --verbose=4 "/tmp/dmg/Nexus Shell.app" 2>&1 | grep -E "Authority=Developer ID|flags=" || true
+          hdiutil detach /tmp/dmg -quiet
+
+          echo "cask: $version   bundle: $bundle_version"
+          if [ "$bundle_version" != "$version" ]; then
+            echo "::error::Bundle version '$bundle_version' does not match '$version'."
+            exit 1
+          fi
+
+      - name: Rewrite cask
         if: steps.check.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          url="https://$R2_HOST/${{ steps.check.outputs.filename }}"
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -I "$url" || echo "000")
-          echo "HEAD $url -> $code"
-          if [ "$code" != "200" ]; then
-            echo "::notice::${{ steps.check.outputs.new_version }} is released on GitHub but not in R2 yet. Skipping; the next scheduled run will pick it up."
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Resolve sha256
-        id: sha
-        if: steps.r2.outputs.ready == 'true'
-        run: |
-          set -euo pipefail
-          sha='${{ steps.check.outputs.new_sha }}'
-          if [ -n "$sha" ]; then
-            echo "sha256 from the GitHub asset digest: $sha"
-          else
-            # No digest on the asset (older releases predate them) — hash the
-            # artifact we actually ship instead.
-            echo "No asset digest; hashing the R2 copy."
-            curl -fsSL "https://$R2_HOST/${{ steps.check.outputs.filename }}" -o /tmp/installer.dmg
-            sha=$(shasum -a 256 /tmp/installer.dmg | cut -d' ' -f1)
-            echo "sha256 computed: $sha"
-          fi
-          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
-
-      - name: Rewrite cask
-        if: steps.r2.outputs.ready == 'true'
-        run: |
-          set -euo pipefail
           sed -i '' -E "s|^  version \".*\"|  version \"${{ steps.check.outputs.new_version }}\"|" "$CASK_PATH"
-          sed -i '' -E "s|^  sha256 \".*\"|  sha256 \"${{ steps.sha.outputs.sha256 }}\"|" "$CASK_PATH"
+          sed -i '' -E "s|^  sha256 \".*\"|  sha256 \"${{ steps.artifact.outputs.sha256 }}\"|" "$CASK_PATH"
           git --no-pager diff -- "$CASK_PATH"
 
-      - name: Register as a local tap
-        if: steps.r2.outputs.ready == 'true'
+      - name: brew style + audit
+        if: steps.check.outputs.changed == 'true'
+        env:
+          HOMEBREW_DEVELOPER: 1
         run: |
           set -euo pipefail
           taps="$(brew --repository)/Library/Taps/viewer12"
           mkdir -p "$taps"
           ln -sfn "$GITHUB_WORKSPACE" "$taps/homebrew-tap"
-          brew tap | grep viewer12
           brew trust --tap viewer12/tap
 
-      - name: brew style + audit
-        if: steps.r2.outputs.ready == 'true'
-        env:
-          HOMEBREW_DEVELOPER: 1
-        run: |
-          set -euo pipefail
           brew style "$CASK_PATH"
-          # Deliberately NOT --online: that check fetches the `homepage`
-          # (nexusshell.app), which 403s from GitHub's IPs behind Cloudflare
-          # bot protection. The install smoke test below downloads the real
-          # artifact anyway, which is the part that actually matters.
+          # NOT --online: that fetches the cask's homepage and url, both of
+          # which 403 from here. The artifact checks above cover what --online
+          # would have told us about the download.
           brew audit --cask --strict viewer12/tap/nexus-shell
 
-      - name: Install smoke test
-        if: steps.r2.outputs.ready == 'true'
-        run: |
-          set -euo pipefail
-          brew install --cask viewer12/tap/nexus-shell
-          test -d "/Applications/Nexus Shell.app"
-
-          # The installed bundle's version must match the cask exactly.
-          #
-          # This is not cosmetic. `auto_updates true` makes `brew upgrade`
-          # compare the cask version against CFBundleShortVersionString, and
-          # that comparison returns nil — silently meaning "not outdated" —
-          # when the two have a different number of dot-separated segments.
-          # Ship a cask "1.6" against a bundle "1.6.0" and every user is
-          # frozen forever with no error anywhere. Asserting equality here
-          # subsumes the segment check and catches release drift too.
-          bundle_version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
-            "/Applications/Nexus Shell.app/Contents/Info.plist")
-          echo "cask: ${{ steps.check.outputs.new_version }}   bundle: $bundle_version"
-          if [ "$bundle_version" != "${{ steps.check.outputs.new_version }}" ]; then
-            echo "::error::Bundle version '$bundle_version' does not match cask version '${{ steps.check.outputs.new_version }}'."
-            exit 1
-          fi
-
-          brew uninstall --cask nexus-shell
-
       - name: Commit
-        if: steps.r2.outputs.ready == 'true'
+        if: steps.check.outputs.changed == 'true'
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
@@ -177,6 +171,7 @@ jobs:
           git commit -m "nexus-shell ${{ steps.check.outputs.new_version }}
 
           Bumped from ${{ steps.check.outputs.cur_version }} by the scheduled
-          release poll. Validated with brew style, brew audit --strict, and an
-          install smoke test on an arm64 runner."
+          manifest poll. sha256 cross-checked against both the release manifest
+          and the artifact itself; bundle version asserted equal to the cask
+          version; brew style and brew audit --strict clean."
           git push
