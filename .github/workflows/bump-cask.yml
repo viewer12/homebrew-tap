@@ -90,6 +90,42 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Guard — minimum macOS still matches depends_on
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # The bot rewrites version + sha256 ONLY. `depends_on macos:` is
+          # hand-maintained, because Homebrew symbols are major-version-only and
+          # can't be derived from a "14.2" point release automatically. If a
+          # release raises the minimum macOS major, the cask's symbol silently
+          # goes stale and brew would let a too-old Mac install an app that
+          # can't launch. Turn that silent failure into a loud one: block the
+          # bump until a human updates `depends_on macos:` in the same change.
+          min_macos=$(jq -r '.min_macos // empty' /tmp/latest.json)
+          if [ -z "$min_macos" ]; then
+            echo "::notice::manifest has no min_macos; skipping the depends_on guard."
+            exit 0
+          fi
+          major="${min_macos%%.*}"
+          # macOS major -> Homebrew symbol. Extend this map (and the cask) when
+          # a new macOS ships. An unrecognised major fails on purpose.
+          case "$major" in
+            13) want="ventura"  ;;
+            14) want="sonoma"   ;;
+            15) want="sequoia"  ;;
+            26) want="tahoe"    ;;
+            *)
+              echo "::error::Unrecognised macOS major '$major' (min_macos=$min_macos). Add it to the major→symbol map in bump-cask.yml and set the cask's 'depends_on macos:' to match, then re-run."
+              exit 1
+              ;;
+          esac
+          have=$(sed -n 's/^  depends_on macos: :\([a-z_]*\).*/\1/p' "$CASK_PATH")
+          echo "manifest min_macos=$min_macos (major $major -> :$want)   cask declares :$have"
+          if [ "$have" != "$want" ]; then
+            echo "::error::Minimum macOS changed: manifest wants :$want but the cask declares :$have. Hand-edit 'depends_on macos: :$want' in $CASK_PATH in the same change, then re-run. (The bot never rewrites depends_on.)"
+            exit 1
+          fi
+
       - name: Fetch and verify the artifact
         id: artifact
         if: steps.check.outputs.changed == 'true'
