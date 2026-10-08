@@ -1,6 +1,6 @@
 cask "nexus-shell" do
-  version "1.7.9"
-  sha256 "2b47a2caa71d165dfeb5db5efd16ae2382c3de923115d0a023e576c76920c049"
+  version "1.7.10"
+  sha256 "437de5ff20457c69ce8080278b9b160fe15581a27853d56976b0c2d59ca425e7"
 
   url "https://releases.nexusshell.app/Nexus-Shell-v#{version}.dmg"
   name "Nexus Shell"
